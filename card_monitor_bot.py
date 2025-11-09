@@ -57,6 +57,22 @@ stats = {
     'started_at': datetime.now()
 }
 
+def mask_card(card_data: str) -> str:
+    """Mask card data for logging/display."""
+    if not card_data:
+        return ""
+    parts = card_data.split('|')
+    if not parts:
+        return card_data
+    number = parts[0]
+    if len(number) > 10:
+        masked_number = f"{number[:6]}{'*' * max(0, len(number) - 10)}{number[-4:]}"
+    elif len(number) > 4:
+        masked_number = f"{number[:4]}****"
+    else:
+        masked_number = "*" * len(number)
+    return '|'.join([masked_number, *parts[1:]])
+
 # ==================== LUHN ALGORITHM ====================
 def luhn_checksum(card_number: str) -> int:
     """Calculate Luhn checksum for a card number."""
@@ -331,7 +347,9 @@ class StripeChecker:
         Check if a card is valid using Stripe.
         Returns: (success: bool, message: str)
         """
+        masked_card = mask_card(card_data)
         if not self.keys:
+            logger.error(f"Stripe check failed for {masked_card}: No Stripe keys available")
             return False, "No Stripe keys available"
         
         local_keys = list(self.keys)
@@ -344,7 +362,9 @@ class StripeChecker:
             ]
             if not candidates:
                 if self.keys:
+                    logger.error(f"Stripe check failed for {masked_card}: No valid Stripe keys remaining")
                     return False, "No valid Stripe keys remaining"
+                logger.error(f"Stripe check failed for {masked_card}: No Stripe keys available")
                 return False, "No Stripe keys available"
             
             key_pair = random.choice(candidates)
@@ -367,7 +387,9 @@ class StripeChecker:
                     local_keys = list(self.keys)
                     tried.discard(sk)
                     continue
-                return False, self.format_failure_message(decline, advise)
+                message = self.format_failure_message(decline, advise)
+                logger.warning(f"Stripe decline during source creation for {masked_card}: {message}")
+                return False, message
             
             source_id = src_result['id']
             
@@ -381,13 +403,16 @@ class StripeChecker:
                     local_keys = list(self.keys)
                     tried.discard(sk)
                     continue
-                return False, self.format_failure_message(decline, advise)
+                message = self.format_failure_message(decline, advise)
+                logger.warning(f"Stripe decline during customer creation for {masked_card}: {message}")
+                return False, message
             
             customer_id = cust_result['id']
             
             # Create and confirm setup intent
             setup_intent_result = await self.create_and_confirm_setup_intent(sk, customer_id, source_id)
             if isinstance(setup_intent_result, dict) and setup_intent_result.get('status') == 'succeeded':
+                logger.info(f"Stripe authorization succeeded for {masked_card}")
                 return True, "Card authorized successfully"
             
             decline = setup_intent_result.get('error') if isinstance(setup_intent_result, dict) else 'Setup intent confirmation failed'
@@ -403,7 +428,9 @@ class StripeChecker:
             if isinstance(setup_intent_result, dict) and setup_intent_result.get('status'):
                 decline = setup_intent_result.get('status')
             
-            return False, self.format_failure_message(decline or 'Setup intent confirmation failed', advise)
+            message = self.format_failure_message(decline or 'Setup intent confirmation failed', advise)
+            logger.warning(f"Stripe decline during setup intent for {masked_card}: {message}")
+            return False, message
 
 # ==================== BOT LOGIC ====================
 stripe_checker = StripeChecker()
