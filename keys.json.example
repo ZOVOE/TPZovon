@@ -1,14 +1,32 @@
 {
-  "default": [
+  "primary": [
     {
-      "sk": "sk_live_your_secret_key_here",
-      "pk": "pk_live_your_publishable_key_here"
+      "sk": "sk_live_your_primary_secret_key_1",
+      "pk": "pk_live_your_primary_publishable_key_1"
+    },
+    {
+      "sk": "sk_live_your_primary_secret_key_2",
+      "pk": "pk_live_your_primary_publishable_key_2"
+    },
+    {
+      "sk": "sk_live_your_primary_secret_key_3",
+      "pk": "pk_live_your_primary_publishable_key_3"
     }
   ],
   "backup": [
     {
-      "sk": "sk_live_another_secret_key",
-      "pk": "pk_live_another_publishable_key"
+      "sk": "sk_live_your_backup_secret_key_1",
+      "pk": "pk_live_your_backup_publishable_key_1"
+    },
+    {
+      "sk": "sk_live_your_backup_secret_key_2",
+      "pk": "pk_live_your_backup_publishable_key_2"
+    }
+  ],
+  "testing": [
+    {
+      "sk": "sk_live_your_testing_secret_key",
+      "pk": "pk_live_your_testing_publishable_key"
     }
   ]
 }
