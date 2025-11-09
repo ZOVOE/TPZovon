@@ -131,6 +131,10 @@ class StripeChecker:
         self.session: Optional[aiohttp.ClientSession] = None
         self.keys = []  # Will be loaded from keys.json
         self.timeout = aiohttp.ClientTimeout(total=30)
+        self.proxy_url = (
+            "http://abc9340056_bbii-zone-star-region-US:22708872@"
+            "na.d9948b8569c695d3.abcproxy.vip:4950"
+        )
     
     @staticmethod
     def extract_decline_code_and_advice(body_text: str) -> Tuple[str, str]:
@@ -233,7 +237,7 @@ class StripeChecker:
         
         session = await self.ensure_session()
         try:
-            async with session.post(url, data=payload) as resp:
+            async with session.post(url, data=payload, proxy=self.proxy_url) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -256,7 +260,7 @@ class StripeChecker:
         
         session = await self.ensure_session()
         try:
-            async with session.post(url, data=payload, auth=BasicAuth(sk, "")) as resp:
+            async with session.post(url, data=payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -283,7 +287,7 @@ class StripeChecker:
         }
         
         try:
-            async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, "")) as create_resp:
+            async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as create_resp:
                 create_text = await create_resp.text()
                 if create_resp.status != 200:
                     decline, advise = self.extract_decline_code_and_advice(create_text)
@@ -307,7 +311,7 @@ class StripeChecker:
         }
         
         try:
-            async with session.post(confirm_url, data=confirm_payload, auth=BasicAuth(sk, "")) as confirm_resp:
+            async with session.post(confirm_url, data=confirm_payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as confirm_resp:
                 if confirm_resp.status == 200:
                     return await confirm_resp.json()
                 confirm_text = await confirm_resp.text()
