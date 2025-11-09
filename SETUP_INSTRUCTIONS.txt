@@ -1,0 +1,150 @@
+╔════════════════════════════════════════════════════════════════════════╗
+║                  🔧 CONFIGURATION INSTRUCTIONS                         ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+Your bot is installed but needs credentials. Follow these steps:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 STEP 1: GET TELEGRAM CREDENTIALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A) Get API ID & API Hash:
+   1. Visit: https://my.telegram.org
+   2. Log in with your phone number
+   3. Click "API Development Tools"
+   4. Create an app (name it anything, e.g., "Card Monitor Bot")
+   5. Copy:
+      • api_id (number)
+      • api_hash (long string)
+
+B) Get Bot Token:
+   1. Open Telegram, search: @BotFather
+   2. Send: /newbot
+   3. Follow instructions
+   4. Copy the bot token (looks like: 123456789:ABCdef...)
+   
+   ⚠️ IMPORTANT:
+   5. Send: /mybots
+   6. Select your bot → Bot Settings → Group Privacy → Turn OFF
+   7. Add your bot to group: -1002587158726
+
+C) Get Your User ID:
+   1. Search: @userinfobot
+   2. Start it
+   3. Copy your user ID (number)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 STEP 2: EDIT CONFIG.ENV
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run this command:
+   nano config.env
+
+Replace these lines with YOUR credentials:
+   API_ID=12345678                              ← Your api_id
+   API_HASH=abcdef1234567890abcdef1234567890    ← Your api_hash
+   BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUV  ← Your bot token
+
+The group ID and user ID are already correct:
+   MONITORED_GROUP_ID=-1002587158726  ✓ (already set)
+   OWNER_USER_ID=5211166230           ✓ (already set)
+
+Save: Ctrl+O, Enter, Ctrl+X
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 STEP 3: ADD STRIPE KEYS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run this command:
+   nano keys.json
+
+Replace with your Stripe keys:
+
+{
+  "default": [
+    {
+      "sk": "sk_live_your_secret_key_here",
+      "pk": "pk_live_your_publishable_key_here"
+    }
+  ]
+}
+
+⚠️ IMPORTANT: Use LIVE mode keys (sk_live_ and pk_live_)
+
+Add multiple keys for better performance:
+
+{
+  "default": [
+    {"sk": "sk_live_key1", "pk": "pk_live_key1"},
+    {"sk": "sk_live_key2", "pk": "pk_live_key2"},
+    {"sk": "sk_live_key3", "pk": "pk_live_key3"}
+  ]
+}
+
+Save: Ctrl+O, Enter, Ctrl+X
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 STEP 4: RUN THE BOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run:
+   python3 card_monitor_bot.py
+
+You should see:
+   ✅ "Bot started successfully!"
+   ✅ "Monitoring group: -1002587158726"
+   ✅ "Reporting to user: 5211166230"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🧪 STEP 5: TEST IT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Post a test card in the group:
+   4111111111111111|12|25|123
+
+2. Check bot logs:
+   The bot should detect it and start processing
+
+3. You should receive a report on Telegram within ~30 seconds
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🐛 TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Error: "Please configure your API credentials"
+Fix:   Edit config.env with REAL values (not "your_api_id_here")
+
+Error: "No Stripe keys available"
+Fix:   Edit keys.json with valid SK/PK pairs
+
+Error: Bot not receiving messages
+Fix:   Turn OFF Group Privacy in @BotFather settings
+
+Error: Reports not arriving
+Fix:   Start conversation with your bot (send /start)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 QUICK COMMAND REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Edit config:     nano config.env
+Edit keys:       nano keys.json
+Run bot:         python3 card_monitor_bot.py
+View logs:       tail -f bot.log
+Stop bot:        Ctrl+C (or: pkill -f card_monitor_bot.py)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Need more help? Check these files:
+  • QUICK_START.md
+  • CARD_BOT_README.md
+  • MULTI_KEY_GUIDE.md
+
+Good luck! 🚀
