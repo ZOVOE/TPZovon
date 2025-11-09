@@ -1,0 +1,14 @@
+{
+  "default": [
+    {
+      "sk": "sk_live_your_secret_key_here",
+      "pk": "pk_live_your_publishable_key_here"
+    }
+  ],
+  "backup": [
+    {
+      "sk": "sk_live_another_secret_key",
+      "pk": "pk_live_another_publishable_key"
+    }
+  ]
+}

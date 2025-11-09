@@ -1,0 +1,14 @@
+# High-Performance Card Monitor Bot Requirements
+
+# Telegram library (fastest Python client)
+pyrogram>=2.0.106
+tgcrypto>=1.2.5  # For faster encryption
+
+# HTTP requests
+aiohttp>=3.9.0
+
+# Stripe SDK (optional, for advanced features)
+stripe>=7.0.0
+
+# Utilities
+python-dotenv>=1.0.0

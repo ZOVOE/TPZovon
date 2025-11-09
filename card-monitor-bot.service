@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Card Monitor and Checker Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/workspace
+ExecStart=/workspace/venv/bin/python3 /workspace/card_monitor_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/workspace/bot.log
+StandardError=append:/workspace/bot.log
+
+[Install]
+WantedBy=multi-user.target
