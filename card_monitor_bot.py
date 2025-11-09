@@ -145,6 +145,7 @@ class StripeChecker:
         import json
         import os
         
+        self.keys = []
         try:
             if os.path.exists('keys.json'):
                 with open('keys.json', 'r') as f:
@@ -172,6 +173,7 @@ class StripeChecker:
             return {'error': 'Invalid card format'}
         
         number, exp_month, exp_year = parts[:3]
+        cvc = parts[3] if len(parts) > 3 else ''
         
         url = "https://api.stripe.com/v1/sources"
         payload = {
@@ -182,6 +184,8 @@ class StripeChecker:
             "key": pk,
             "payment_user_agent": "stripe.js/v3",
         }
+        if cvc:
+            payload["card[cvc]"] = cvc
         
         session = await self.ensure_session()
         try:
@@ -209,6 +213,42 @@ class StripeChecker:
                     return {'error': f'HTTP {resp.status}', 'details': text}
         except Exception as e:
             return {'error': str(e)}
+
+    async def create_and_confirm_setup_intent(self, sk: str, customer_id: str, source_id: str) -> Dict:
+        """Create and confirm a SetupIntent using the provided customer and source."""
+        session = await self.ensure_session()
+        
+        create_url = "https://api.stripe.com/v1/setup_intents"
+        create_payload = {
+            "customer": customer_id,
+            "payment_method_types[]": "card"
+        }
+        
+        try:
+            async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, "")) as create_resp:
+                create_text = await create_resp.text()
+                if create_resp.status != 200:
+                    return {'error': f'HTTP {create_resp.status}', 'details': create_text}
+                setup_intent = await create_resp.json()
+                setup_intent_id = setup_intent.get('id')
+                if not setup_intent_id:
+                    return {'error': 'No setup intent ID returned', 'details': create_text}
+        except Exception as e:
+            return {'error': str(e)}
+        
+        confirm_url = f"https://api.stripe.com/v1/setup_intents/{setup_intent_id}/confirm"
+        confirm_payload = {
+            "payment_method": source_id
+        }
+        
+        try:
+            async with session.post(confirm_url, data=confirm_payload, auth=BasicAuth(sk, "")) as confirm_resp:
+                if confirm_resp.status == 200:
+                    return await confirm_resp.json()
+                confirm_text = await confirm_resp.text()
+                return {'error': f'HTTP {confirm_resp.status}', 'details': confirm_text}
+        except Exception as e:
+            return {'error': str(e)}
     
     async def check_card(self, card_data: str) -> Tuple[bool, str]:
         """
@@ -227,22 +267,39 @@ class StripeChecker:
         
         # Create source
         src_result = await self.create_source(pk, card_data)
-        if 'error' in src_result:
-            return False, src_result.get('error', 'Source creation failed')
+        if 'error' in src_result or 'id' not in src_result:
+            message = src_result.get('error', 'Source creation failed')
+            details = src_result.get('details')
+            if details:
+                message = f"{message}: {details}"
+            return False, message
         
-        source_id = src_result.get('id')
-        if not source_id:
-            return False, "No source ID returned"
+        source_id = src_result['id']
         
         # Create customer
         cust_result = await self.create_customer(sk, source_id)
-        if 'error' in cust_result:
-            return False, cust_result.get('error', 'Customer creation failed')
+        if 'error' in cust_result or 'id' not in cust_result:
+            message = cust_result.get('error', 'Customer creation failed')
+            details = cust_result.get('details')
+            if details:
+                message = f"{message}: {details}"
+            return False, message
         
-        if cust_result.get('id'):
-            return True, "Card verified successfully"
+        customer_id = cust_result['id']
         
-        return False, "Unknown error"
+        # Create and confirm setup intent
+        setup_intent_result = await self.create_and_confirm_setup_intent(sk, customer_id, source_id)
+        if 'error' in setup_intent_result:
+            message = setup_intent_result.get('error', 'Setup intent confirmation failed')
+            details = setup_intent_result.get('details')
+            if details:
+                message = f"{message}: {details}"
+            return False, message
+        
+        if setup_intent_result.get('status') == 'succeeded':
+            return True, "Card authorized successfully"
+        
+        return False, setup_intent_result.get('status', 'Unknown error')
 
 # ==================== BOT LOGIC ====================
 stripe_checker = StripeChecker()
