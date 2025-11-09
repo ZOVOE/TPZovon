@@ -11,6 +11,7 @@ import os
 from typing import List, Tuple, Optional, Dict, Set
 from datetime import datetime
 import random
+import json
 from collections import deque
 
 from pyrogram import Client, filters
@@ -124,10 +125,59 @@ def generate_cards_from_bin(bin_prefix: str, exp_month: str, exp_year: str, coun
 class StripeChecker:
     """Handles Stripe API card validation."""
     
+    INVALID_KEY_ERRORS = {'api_key_expired', 'testmode_charges_only'}
+    
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.keys = []  # Will be loaded from keys.json
         self.timeout = aiohttp.ClientTimeout(total=30)
+    
+    @staticmethod
+    def extract_decline_code_and_advice(body_text: str) -> Tuple[str, str]:
+        """Extract decline and advice codes from a Stripe error payload."""
+        try:
+            body = json.loads(body_text)
+        except Exception:
+            return ("Unknown error", "No advice")
+        
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            decline_code = (
+                err.get("decline_code")
+                or err.get("code")
+                or err.get("error")
+                or err.get("message")
+                or "Unknown error"
+            )
+            advise_code = (
+                err.get("failure_code")
+                or err.get("advice")
+                or err.get("message")
+                or "No advice"
+            )
+        else:
+            decline_code = "Unknown error"
+            advise_code = "No advice"
+        
+        return (decline_code, advise_code)
+    
+    def _remove_key_pair(self, secret_key: str) -> None:
+        """Remove a key pair from the loaded keys when it is invalid."""
+        if not secret_key:
+            return
+        before = len(self.keys)
+        self.keys = [
+            pair for pair in self.keys
+            if (pair.get('sk') or pair.get('secret_key')) != secret_key
+        ]
+        if before != len(self.keys):
+            logger.warning(f"Removed invalid Stripe key: {secret_key[:10]}***")
+    
+    @staticmethod
+    def format_failure_message(decline: str, advise: Optional[str]) -> str:
+        if advise and advise != "No advice":
+            return f"{decline} | {advise}"
+        return decline
     
     async def ensure_session(self):
         """Ensure aiohttp session is initialized."""
@@ -142,9 +192,6 @@ class StripeChecker:
     
     def load_keys(self):
         """Load Stripe keys from keys.json or return test keys."""
-        import json
-        import os
-        
         self.keys = []
         try:
             if os.path.exists('keys.json'):
@@ -191,7 +238,14 @@ class StripeChecker:
                     return await resp.json()
                 else:
                     text = await resp.text()
-                    return {'error': f'HTTP {resp.status}', 'details': text}
+                    decline, advise = self.extract_decline_code_and_advice(text)
+                    retry_key = decline in self.INVALID_KEY_ERRORS or resp.status == 401
+                    return {
+                        'error': decline if decline != "Unknown error" else f'HTTP {resp.status}',
+                        'advise': advise,
+                        'details': text,
+                        'retry_key': retry_key
+                    }
         except Exception as e:
             return {'error': str(e)}
     
@@ -207,7 +261,14 @@ class StripeChecker:
                     return await resp.json()
                 else:
                     text = await resp.text()
-                    return {'error': f'HTTP {resp.status}', 'details': text}
+                    decline, advise = self.extract_decline_code_and_advice(text)
+                    retry_key = decline in self.INVALID_KEY_ERRORS or resp.status in (401, 403)
+                    return {
+                        'error': decline if decline != "Unknown error" else f'HTTP {resp.status}',
+                        'advise': advise,
+                        'details': text,
+                        'retry_key': retry_key
+                    }
         except Exception as e:
             return {'error': str(e)}
 
@@ -225,7 +286,14 @@ class StripeChecker:
             async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, "")) as create_resp:
                 create_text = await create_resp.text()
                 if create_resp.status != 200:
-                    return {'error': f'HTTP {create_resp.status}', 'details': create_text}
+                    decline, advise = self.extract_decline_code_and_advice(create_text)
+                    retry_key = decline in self.INVALID_KEY_ERRORS or create_resp.status in (401, 403)
+                    return {
+                        'error': decline if decline != "Unknown error" else f'HTTP {create_resp.status}',
+                        'advise': advise,
+                        'details': create_text,
+                        'retry_key': retry_key
+                    }
                 setup_intent = await create_resp.json()
                 setup_intent_id = setup_intent.get('id')
                 if not setup_intent_id:
@@ -243,7 +311,14 @@ class StripeChecker:
                 if confirm_resp.status == 200:
                     return await confirm_resp.json()
                 confirm_text = await confirm_resp.text()
-                return {'error': f'HTTP {confirm_resp.status}', 'details': confirm_text}
+                decline, advise = self.extract_decline_code_and_advice(confirm_text)
+                retry_key = decline in self.INVALID_KEY_ERRORS or confirm_resp.status in (401, 403)
+                return {
+                    'error': decline if decline != "Unknown error" else f'HTTP {confirm_resp.status}',
+                    'advise': advise,
+                    'details': confirm_text,
+                    'retry_key': retry_key
+                }
         except Exception as e:
             return {'error': str(e)}
     
@@ -252,51 +327,79 @@ class StripeChecker:
         Check if a card is valid using Stripe.
         Returns: (success: bool, message: str)
         """
-        key_pair = self.get_random_key_pair()
-        if not key_pair:
+        if not self.keys:
             return False, "No Stripe keys available"
         
-        sk = key_pair.get('sk') or key_pair.get('secret_key')
-        pk = key_pair.get('pk') or key_pair.get('publishable_key')
+        local_keys = list(self.keys)
+        tried: Set[str] = set()
         
-        if not sk or not pk:
-            return False, "Invalid key pair"
-        
-        # Create source
-        src_result = await self.create_source(pk, card_data)
-        if 'error' in src_result or 'id' not in src_result:
-            message = src_result.get('error', 'Source creation failed')
-            details = src_result.get('details')
-            if details:
-                message = f"{message}: {details}"
-            return False, message
-        
-        source_id = src_result['id']
-        
-        # Create customer
-        cust_result = await self.create_customer(sk, source_id)
-        if 'error' in cust_result or 'id' not in cust_result:
-            message = cust_result.get('error', 'Customer creation failed')
-            details = cust_result.get('details')
-            if details:
-                message = f"{message}: {details}"
-            return False, message
-        
-        customer_id = cust_result['id']
-        
-        # Create and confirm setup intent
-        setup_intent_result = await self.create_and_confirm_setup_intent(sk, customer_id, source_id)
-        if 'error' in setup_intent_result:
-            message = setup_intent_result.get('error', 'Setup intent confirmation failed')
-            details = setup_intent_result.get('details')
-            if details:
-                message = f"{message}: {details}"
-            return False, message
-        
-        if setup_intent_result.get('status') == 'succeeded':
-            return True, "Card authorized successfully"
-        
-        return False, setup_intent_result.get('status', 'Unknown error')
+        while True:
+            candidates = [
+                pair for pair in local_keys
+                if (pair.get('sk') or pair.get('secret_key')) not in tried
+            ]
+            if not candidates:
+                if self.keys:
+                    return False, "No valid Stripe keys remaining"
+                return False, "No Stripe keys available"
+            
+            key_pair = random.choice(candidates)
+            sk = key_pair.get('sk') or key_pair.get('secret_key')
+            pk = key_pair.get('pk') or key_pair.get('publishable_key')
+            
+            if not sk or not pk:
+                tried.add(sk or "")
+                continue
+            
+            tried.add(sk)
+            
+            # Create source
+            src_result = await self.create_source(pk, card_data)
+            if not src_result or 'id' not in src_result:
+                decline = src_result.get('error', 'Source creation failed') if isinstance(src_result, dict) else 'Source creation failed'
+                advise = src_result.get('advise') if isinstance(src_result, dict) else None
+                if isinstance(src_result, dict) and src_result.get('retry_key'):
+                    self._remove_key_pair(sk)
+                    local_keys = list(self.keys)
+                    tried.discard(sk)
+                    continue
+                return False, self.format_failure_message(decline, advise)
+            
+            source_id = src_result['id']
+            
+            # Create customer
+            cust_result = await self.create_customer(sk, source_id)
+            if not cust_result or 'id' not in cust_result:
+                decline = cust_result.get('error', 'Customer creation failed') if isinstance(cust_result, dict) else 'Customer creation failed'
+                advise = cust_result.get('advise') if isinstance(cust_result, dict) else None
+                if isinstance(cust_result, dict) and cust_result.get('retry_key'):
+                    self._remove_key_pair(sk)
+                    local_keys = list(self.keys)
+                    tried.discard(sk)
+                    continue
+                return False, self.format_failure_message(decline, advise)
+            
+            customer_id = cust_result['id']
+            
+            # Create and confirm setup intent
+            setup_intent_result = await self.create_and_confirm_setup_intent(sk, customer_id, source_id)
+            if isinstance(setup_intent_result, dict) and setup_intent_result.get('status') == 'succeeded':
+                return True, "Card authorized successfully"
+            
+            decline = setup_intent_result.get('error') if isinstance(setup_intent_result, dict) else 'Setup intent confirmation failed'
+            advise = setup_intent_result.get('advise') if isinstance(setup_intent_result, dict) else None
+            retry_key = isinstance(setup_intent_result, dict) and setup_intent_result.get('retry_key')
+            
+            if retry_key:
+                self._remove_key_pair(sk)
+                local_keys = list(self.keys)
+                tried.discard(sk)
+                continue
+            
+            if isinstance(setup_intent_result, dict) and setup_intent_result.get('status'):
+                decline = setup_intent_result.get('status')
+            
+            return False, self.format_failure_message(decline or 'Setup intent confirmation failed', advise)
 
 # ==================== BOT LOGIC ====================
 stripe_checker = StripeChecker()
