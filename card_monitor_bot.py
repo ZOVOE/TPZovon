@@ -173,7 +173,6 @@ class StripeChecker:
             return {'error': 'Invalid card format'}
         
         number, exp_month, exp_year = parts[:3]
-        cvc = parts[3] if len(parts) > 3 else ''
         
         url = "https://api.stripe.com/v1/sources"
         payload = {
@@ -184,8 +183,6 @@ class StripeChecker:
             "key": pk,
             "payment_user_agent": "stripe.js/v3",
         }
-        if cvc:
-            payload["card[cvc]"] = cvc
         
         session = await self.ensure_session()
         try:
