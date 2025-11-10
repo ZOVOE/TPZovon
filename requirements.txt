@@ -12,3 +12,4 @@ stripe>=7.0.0
 
 # Utilities
 python-dotenv>=1.0.0
+colorama>=0.4.6

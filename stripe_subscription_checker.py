@@ -35,6 +35,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from colorama import Fore, Style, init as colorama_init
+
 import aiohttp
 from aiohttp import BasicAuth, ClientSession, ClientTimeout
 
@@ -44,6 +46,42 @@ MAX_CARDS = 20
 REQUEST_TIMEOUT = int(os.getenv("SUB_CHECK_TIMEOUT", "30"))
 STRIPE_API_BASE = "https://api.stripe.com"
 KEYS_FILE = os.getenv("STRIPE_KEYS_FILE", "keys.json")
+
+STAGE_CODES = {
+    "start": "START",
+    "create_source": "SRC",
+    "create_customer": "CUST",
+    "setup_intent": "S_I",
+    "subscription": "SUB",
+    "invoice_missing": "INVOICE",
+    "invoice_pay": "INVOICE",
+}
+
+def stage_label(stage: Optional[str]) -> str:
+    if not stage:
+        return "UNKNOWN"
+    return STAGE_CODES.get(stage, stage.upper())
+
+
+def extract_error_code(details: Optional[Dict]) -> str:
+    if isinstance(details, dict):
+        err = details.get("error")
+        if isinstance(err, dict):
+            for key in ("decline_code", "code", "type", "message"):
+                val = err.get(key)
+                if val:
+                    return str(val).replace(" ", "_")
+        for key in ("status", "failure_code", "message"):
+            val = details.get(key)
+            if val:
+                return str(val).replace(" ", "_")
+        raw = details.get("raw")
+        if isinstance(raw, str):
+            return raw[:60]
+        return json.dumps(details)
+    if details:
+        return str(details)
+    return "UNKNOWN"
 
 
 @dataclass
@@ -121,6 +159,9 @@ class StripeSubscriptionChecker:
             "payment_method": payment_method,
             "confirm": "true",
             "usage": "off_session",
+            "return_url": "https://example.com/stripe-return",
+            "automatic_payment_methods[enabled]": "true",
+            "automatic_payment_methods[allow_redirects]": "never",
         }
         status, payload = await self._post(
             "/v1/setup_intents",
@@ -316,11 +357,23 @@ async def main_async(args: argparse.Namespace) -> None:
             start = time.time()
             info = await checker.run_card(card)
             duration = time.time() - start
-            status = info["status"].upper()
-            print(f"{card} → {status} ({info['stage']}) [{duration:.2f}s] using {key_pair.secret_key[:10]}...")
-            if info.get("details"):
-                print(json.dumps(info["details"], indent=2, ensure_ascii=False))
-            print("-" * 60)
+
+            stage = stage_label(info.get("stage"))
+            if info["status"] == "success":
+                status_code = "SUCCESS"
+                line = f"{card}|{status_code}|{stage}"
+                meta = f"[{duration:.2f}s | {key_pair.secret_key[:10]}...]"
+                print(f"{Fore.GREEN}{line}{Style.RESET_ALL} {Style.DIM}{meta}{Style.RESET_ALL}")
+                print(f"{Style.DIM}{'-' * 70}{Style.RESET_ALL}")
+            else:
+                status_code = extract_error_code(info.get("details"))
+                line = f"{card}|{status_code}|{stage}"
+                meta = f"[{duration:.2f}s | {key_pair.secret_key[:10]}...]"
+                print(f"{Fore.RED}{line}{Style.RESET_ALL} {Style.DIM}{meta}{Style.RESET_ALL}")
+                if info.get("details"):
+                    pretty = json.dumps(info["details"], indent=2, ensure_ascii=False)
+                    print(f"{Fore.YELLOW}{pretty}{Style.RESET_ALL}")
+                print(f"{Style.DIM}{'-' * 70}{Style.RESET_ALL}")
     finally:
         for checker in checkers.values():
             await checker.close()
@@ -333,6 +386,7 @@ def main() -> None:
     parser.add_argument("--publishable-key", help="Stripe publishable key (live)")
     args = parser.parse_args()
 
+    colorama_init(autoreset=True)
     asyncio.run(main_async(args))
 
 
