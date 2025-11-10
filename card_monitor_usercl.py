@@ -64,7 +64,8 @@ async def process_group(app: Client, chat_id: int) -> None:
 
     while True:
         try:
-            history = await app.get_chat_history(chat_id, offset_id=offset_id, limit=FETCH_BATCH_SIZE)
+            history_iter = app.get_chat_history(chat_id, offset_id=offset_id, limit=FETCH_BATCH_SIZE)
+            history = [message async for message in history_iter]
         except FloodWait as fw:
             wait_time = fw.value + 1
             logger.warning("FloodWait %ss while fetching history for %s. Sleeping.", wait_time, chat_id)
