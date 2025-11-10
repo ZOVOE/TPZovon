@@ -9,6 +9,11 @@ Usage:
         - Reads cards from file (one per line). Lines with 16-digit card regex
           `dddddddddddddddd|MM|YY[|CVC]` are extracted.
 
+Stripe keys:
+    Provide a pair via --secret-key/--publishable-key or set STRIPE_SECRET_KEY /
+    STRIPE_PUBLISHABLE_KEY. If omitted, the script randomly picks pairs from
+    `keys.json` (same structure as the main bot).
+
 Flow per card:
     1. Create card source via publishable key.
     2. Attach source to customer (created with secret key).
@@ -23,6 +28,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -37,6 +43,7 @@ CARD_REGEX = re.compile(r"(\d{16})\|(\d{1,2})\|(\d{2,4})(?:\|(\d{3,4}))?")
 MAX_CARDS = 20
 REQUEST_TIMEOUT = int(os.getenv("SUB_CHECK_TIMEOUT", "30"))
 STRIPE_API_BASE = "https://api.stripe.com"
+KEYS_FILE = os.getenv("STRIPE_KEYS_FILE", "keys.json")
 
 
 @dataclass
@@ -241,11 +248,48 @@ def parse_cards_from_iterable(lines: Iterable[str]) -> List[str]:
     return cards
 
 
+def load_key_pairs(path: str = KEYS_FILE) -> List[StripeKeys]:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"❌ Failed to load keys from {path}: {exc}")
+        return []
+
+    pairs: List[StripeKeys] = []
+    containers: List = []
+    if isinstance(data, dict):
+        containers = list(data.values())
+    elif isinstance(data, list):
+        containers = [data]
+
+    for container in containers:
+        if not isinstance(container, list):
+            continue
+        for entry in container:
+            if not isinstance(entry, dict):
+                continue
+            sk = entry.get("sk") or entry.get("secret_key")
+            pk = entry.get("pk") or entry.get("publishable_key")
+            if sk and pk:
+                pairs.append(StripeKeys(secret_key=sk, publishable_key=pk))
+    return pairs
+
+
 async def main_async(args: argparse.Namespace) -> None:
     secret_key = args.secret_key or os.getenv("STRIPE_SECRET_KEY")
     publishable_key = args.publishable_key or os.getenv("STRIPE_PUBLISHABLE_KEY")
-    if not secret_key or not publishable_key:
-        print("❌ Provide Stripe keys via arguments or STRIPE_SECRET_KEY/STRIPE_PUBLISHABLE_KEY env vars.")
+
+    key_pairs: List[StripeKeys] = []
+    if secret_key and publishable_key:
+        key_pairs.append(StripeKeys(secret_key=secret_key, publishable_key=publishable_key))
+    else:
+        key_pairs = load_key_pairs()
+
+    if not key_pairs:
+        print("❌ No Stripe keys available. Provide --secret-key/--publishable-key or populate keys.json.")
         return
 
     if args.file:
@@ -260,21 +304,26 @@ async def main_async(args: argparse.Namespace) -> None:
         print("No valid cards found.")
         return
 
-    checker = StripeSubscriptionChecker(
-        StripeKeys(secret_key=secret_key, publishable_key=publishable_key)
-    )
+    checkers: Dict[str, StripeSubscriptionChecker] = {}
     try:
         for card in unique_cards:
+            key_pair = random.choice(key_pairs)
+            checker = checkers.get(key_pair.secret_key)
+            if checker is None:
+                checker = StripeSubscriptionChecker(key_pair)
+                checkers[key_pair.secret_key] = checker
+
             start = time.time()
             info = await checker.run_card(card)
             duration = time.time() - start
             status = info["status"].upper()
-            print(f"{card} → {status} ({info['stage']}) [{duration:.2f}s]")
+            print(f"{card} → {status} ({info['stage']}) [{duration:.2f}s] using {key_pair.secret_key[:10]}...")
             if info.get("details"):
                 print(json.dumps(info["details"], indent=2, ensure_ascii=False))
             print("-" * 60)
     finally:
-        await checker.close()
+        for checker in checkers.values():
+            await checker.close()
 
 
 def main() -> None:
