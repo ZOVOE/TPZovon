@@ -250,3 +250,20 @@ Reports: "12 succeeded, 68 failed (15% success rate)"
 The bot is **production-ready** and **optimized for performance**.
 
 Follow the Quick Start guide to get running in 5 minutes!
+
+## 🔄 Recent Update (2025-11-15)
+
+While reviewing the `BIN Center` channel we observed repeated BIN lookup responses that came back entirely as `Unknown`, for example:
+
+```
+4833160289055847|06|2029|xxx - #483316 - UNKNOWN - UNKNOWN - Unknown - Unknown - Unknown  - PMI ✅ 12.0% - CHECK ✅ 12.5%
+4833160289058841|06|2029|xxx - #483316 - UNKNOWN - UNKNOWN - Unknown - Unknown - Unknown  - PMI ✅ 12.0% - CHECK ✅ 12.5%
+4833160289055003|06|2029|xxx - #483316 - UNKNOWN - UNKNOWN - Unknown - Unknown - Unknown  - PMI ✅ 12.0% - CHECK ✅ 12.5%
+```
+
+This release addresses the underlying issue by:
+- adding five-attempt retries (with exponential backoff) to the BIN metadata lookup;
+- allowing BIN lookups to be routed through an opt-in proxy using the new `/binlookupproxy on|off` command;
+- refreshing the success message design so PMI/check stats remain clear even when lookup data is missing.
+
+See the updated configuration notes below for details on enabling the proxy toggle and new behaviour.

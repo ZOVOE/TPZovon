@@ -61,6 +61,17 @@ nano keys.json  # Add your keys
 
 ---
 
+## 🔌 Proxy Controls & Retries
+
+- Use `/proxy on|off` to toggle Stripe traffic through the configured proxy.
+- Use `/binlookupproxy on|off` to route BIN metadata lookups through `BIN_LOOKUP_PROXY_URL` (set in `config.env`).
+- Configure `BIN_LOOKUP_MAX_RETRIES` (default 5) to control how many times the bot re-requests BIN details before falling back to `Unknown`.
+- Outgoing channel posts now use `CHANNEL_MESSAGE_MAX_RETRIES` (default 5) with exponential backoff to mitigate transient Telegram errors.
+
+Result: BIN metadata issues like the `#483316` example observed in the `BIN Center` channel degrade gracefully while still sharing a clean, minimal summary (including top 3 PMI charges when available).
+
+---
+
 ## ⚡ Key Features
 
 - ✅ **Fast**: Pyrogram (fastest Python Telegram library)
