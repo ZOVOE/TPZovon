@@ -98,6 +98,8 @@ nohup python3 card_monitor_bot.py > bot.log 2>&1 &
 Send these commands in private message to the bot:
 
 - `/stats` - View bot statistics and performance metrics
+- `/proxy on|off` - Toggle the Stripe proxy defined in `config.env`
+- `/binlookupproxy on|off` - Toggle the BIN lookup proxy (`BIN_LOOKUP_PROXY_URL`) used to fetch scheme/bank metadata
 
 ## 📝 Message Format
 

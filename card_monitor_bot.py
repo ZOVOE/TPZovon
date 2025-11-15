@@ -40,6 +40,11 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
 
 SUCCESS_CHANNEL_ID = int(os.getenv('SUCCESS_CHANNEL_ID', '-1003369945982'))
 BIN_LOOKUP_TIMEOUT = int(os.getenv('BIN_LOOKUP_TIMEOUT', '10'))
+BIN_LOOKUP_MAX_RETRIES = max(1, int(os.getenv('BIN_LOOKUP_MAX_RETRIES', '5')))
+BIN_LOOKUP_PROXY_URL = os.getenv('BIN_LOOKUP_PROXY_URL', '').strip()
+BIN_LOOKUP_PROXY_ENABLED = os.getenv('BIN_LOOKUP_PROXY_ENABLED', '0').lower() in {'1', 'true', 'yes', 'on'}
+CHANNEL_MESSAGE_MAX_RETRIES = max(1, int(os.getenv('CHANNEL_MESSAGE_MAX_RETRIES', '5')))
+MESSAGE_RETRY_BASE_DELAY = max(0.5, float(os.getenv('MESSAGE_RETRY_BASE_DELAY', '1.0')))
 TESTED_BINS_PATH = Path(os.getenv('TESTED_BINS_FILE', 'testedbins.txt'))
 
 # Regex to match card format: 16 digits | 1-2 digits | 2-4 digits | optional CVV
@@ -82,6 +87,26 @@ BIN_LOOKUP_HEADERS = {
 bin_lookup_session: Optional[aiohttp.ClientSession] = None
 bin_info_cache: Dict[str, Dict] = {}
 tested_bins: Set[str] = set()
+bin_lookup_proxy_enabled: bool = BIN_LOOKUP_PROXY_ENABLED
+
+
+def _get_bin_lookup_proxy() -> Optional[str]:
+    """Return the proxy URL for BIN lookups if enabled."""
+    if bin_lookup_proxy_enabled and BIN_LOOKUP_PROXY_URL:
+        return BIN_LOOKUP_PROXY_URL
+    return None
+
+
+def set_bin_lookup_proxy_enabled(enabled: bool) -> bool:
+    """Enable or disable routing BIN lookups through the configured proxy."""
+    global bin_lookup_proxy_enabled
+    if enabled and not BIN_LOOKUP_PROXY_URL:
+        logger.warning("BIN lookup proxy requested but BIN_LOOKUP_PROXY_URL is not configured.")
+        return False
+    bin_lookup_proxy_enabled = enabled
+    state = "enabled" if enabled else "disabled"
+    logger.info(f"BIN lookup proxy {state}")
+    return True
 
 def _normalize_bin_prefix(bin_prefix: str) -> str:
     return (bin_prefix or "")[:12]
@@ -132,19 +157,32 @@ async def fetch_bin_details(bin_prefix: str) -> Optional[Dict]:
     if bin6 in bin_info_cache:
         return bin_info_cache[bin6]
     
-    session = await get_bin_lookup_session()
     url = f"https://lookup.binlist.net/{bin6}"
-    try:
-        async with session.get(url, headers=BIN_LOOKUP_HEADERS) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                bin_info_cache[bin6] = data
-                logger.info(f"Fetched BIN info for {bin6}: {data.get('scheme')} {data.get('type')}")
-                return data
-            text = await resp.text()
-            logger.warning(f"BIN lookup failed for {bin6}: HTTP {resp.status} {text}")
-    except Exception as exc:
-        logger.error(f"Error fetching BIN info for {bin6}: {exc}")
+    attempts = max(1, BIN_LOOKUP_MAX_RETRIES)
+    last_error: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        session = await get_bin_lookup_session()
+        try:
+            async with session.get(url, headers=BIN_LOOKUP_HEADERS, proxy=_get_bin_lookup_proxy()) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    bin_info_cache[bin6] = data
+                    logger.info(f"Fetched BIN info for {bin6}: {data.get('scheme')} {data.get('type')}")
+                    return data
+                text = await resp.text()
+                last_error = f"HTTP {resp.status} {text}"
+                logger.warning(
+                    f"BIN lookup failed for {bin6} (attempt {attempt}/{attempts}): {last_error}"
+                )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.error(
+                f"Error fetching BIN info for {bin6} (attempt {attempt}/{attempts}): {exc}"
+            )
+        if attempt < attempts:
+            await asyncio.sleep(min(3.0, MESSAGE_RETRY_BASE_DELAY * attempt))
+    if last_error:
+        logger.error(f"BIN lookup exhausted retries for {bin6}: {last_error}")
     return None
 
 async def close_bin_lookup_session() -> None:
@@ -657,6 +695,97 @@ class StripeChecker:
 load_tested_bins()
 stripe_checker = StripeChecker()
 
+# ==================== NOTIFICATION HELPERS ====================
+
+async def send_message_with_retry(app: Client, chat_id: int, text: str) -> bool:
+    """Send a Telegram message with retry logic."""
+    for attempt in range(1, CHANNEL_MESSAGE_MAX_RETRIES + 1):
+        try:
+            await app.send_message(chat_id, text, disable_web_page_preview=True)
+            return True
+        except Exception as exc:
+            if attempt == CHANNEL_MESSAGE_MAX_RETRIES:
+                logger.error(f"Failed to send message to {chat_id} after {attempt} attempts: {exc}")
+                return False
+            await asyncio.sleep(MESSAGE_RETRY_BASE_DELAY * attempt)
+    return False
+
+
+def _mask_card_for_display(card_value: str) -> str:
+    """Append masked CVV placeholder for display."""
+    parts = card_value.split('|')
+    if len(parts) >= 3:
+        return f"{parts[0]}|{parts[1]}|{parts[2]}|xxx"
+    return card_value
+
+
+async def publish_success_to_channel(
+    app: Client,
+    card_info: Dict,
+    generated_cards: List[str],
+    succeeded_cards: List[str],
+    pmi_results: List[Tuple[str, bool, str]],
+) -> None:
+    """Post a minimal success summary to the success channel."""
+    pmi_success_cards = [card for card, success, _ in pmi_results if success]
+    if not succeeded_cards and not pmi_success_cards:
+        return
+    
+    bin_prefix = card_info['bin']
+    bin6 = bin_prefix[:6]
+    bin_details = card_info.get('bin_details') or stats['bins_processed'].get(bin_prefix, {}).get('bin_details')
+    
+    scheme = ((bin_details or {}).get('scheme') or "UNKNOWN")
+    card_type = ((bin_details or {}).get('type') or "UNKNOWN")
+    brand = ((bin_details or {}).get('brand') or "Unknown")
+    bank_name = (((bin_details or {}).get('bank') or {}).get('name')) or "Unknown"
+    country_info = (bin_details or {}).get('country') or {}
+    country_name = country_info.get('name') or "Unknown"
+    country_emoji = country_info.get('emoji') or ""
+    
+    message_lines = [
+        f"BIN #{bin6} • {scheme.upper()} / {card_type.upper()}",
+    ]
+    
+    if bin_details:
+        message_lines.append(f"Brand: {brand} | Bank: {bank_name}")
+        message_lines.append(f"Country: {country_name} {country_emoji}".strip())
+    else:
+        proxy_state = "on" if bin_lookup_proxy_enabled else "off"
+        message_lines.append(
+            f"BIN lookup unavailable after {BIN_LOOKUP_MAX_RETRIES} retries (proxy {proxy_state})"
+        )
+    
+    total_generated = len(generated_cards)
+    auth_success = len(succeeded_cards)
+    success_rate = (auth_success / total_generated * 100) if total_generated else 0.0
+    check_icon = "✅" if auth_success else "❌"
+    check_line = f"Check {check_icon} {auth_success}/{total_generated} ({success_rate:.1f}%)"
+    
+    pmi_attempts = len(pmi_results)
+    pmi_success = len(pmi_success_cards)
+    if pmi_attempts:
+        pmi_rate = (pmi_success / pmi_attempts * 100) if pmi_attempts else 0.0
+        pmi_icon = "✅" if pmi_success else "❌"
+        pmi_line = f"PMI {pmi_icon} {pmi_success}/{pmi_attempts} ({pmi_rate:.1f}%)"
+    else:
+        pmi_line = "PMI — not run"
+    
+    message_lines.append(f"{check_line} • {pmi_line}")
+    
+    if card_info.get('message_link'):
+        message_lines.append(f"Source: {card_info['message_link']}")
+    else:
+        message_lines.append(f"Message ID: {card_info['message_id']}")
+    
+    if pmi_success_cards:
+        message_lines.append("Top PMI:")
+        for card in pmi_success_cards[:3]:
+            message_lines.append(f"• {_mask_card_for_display(card)}")
+    
+    summary_text = "\n".join(message_lines)
+    await send_message_with_retry(app, SUCCESS_CHANNEL_ID, summary_text)
+
 async def process_card_message(message: Message, app: Client):
     """Extract cards from a message and queue them for processing."""
     if not message.text:
@@ -786,6 +915,7 @@ async def process_queue(app: Client):
 
             # Run PMI flow if we had any authorizations succeed
             pmi_results: List[Tuple[str, bool, str]] = []
+            pmi_success_count = 0
             if succeeded_cards:
                 pmi_cards = generate_cards_from_bin(
                     bin_prefix,
@@ -817,60 +947,13 @@ async def process_queue(app: Client):
                     stats['total_pmi_succeeded'] += pmi_success_count
                     stats['bins_processed'][bin_prefix]['pmi_succeeded'] += pmi_success_count
 
-                    if pmi_success_count > 0:
-                        auth_success_rate = (len(succeeded_cards) / len(generated_cards) * 100) if generated_cards else 0
-                        pmi_success_rate = (pmi_success_count / len(pmi_cards) * 100) if pmi_cards else 0
-                        bin6 = bin_prefix[:6]
-                        scheme_upper = (bin_details or {}).get('scheme', 'UNKNOWN')
-                        scheme_upper = scheme_upper.upper() if isinstance(scheme_upper, str) else str(scheme_upper)
-                        card_type_upper = (bin_details or {}).get('type', 'UNKNOWN')
-                        card_type_upper = card_type_upper.upper() if isinstance(card_type_upper, str) else str(card_type_upper)
-                        brand_name_raw = (bin_details or {}).get('brand')
-                        if isinstance(brand_name_raw, str):
-                            brand_name = brand_name_raw
-                        elif brand_name_raw is None:
-                            brand_name = "Unknown"
-                        else:
-                            brand_name = str(brand_name_raw)
-
-                        bank_name_raw = ((bin_details or {}).get('bank') or {}).get('name')
-                        if isinstance(bank_name_raw, str):
-                            bank_name = bank_name_raw
-                        elif bank_name_raw is None:
-                            bank_name = "Unknown"
-                        else:
-                            bank_name = str(bank_name_raw)
-                        country_info = (bin_details or {}).get('country') or {}
-                        country_name_raw = country_info.get('name')
-                        if isinstance(country_name_raw, str):
-                            country_name = country_name_raw
-                        elif country_name_raw is None:
-                            country_name = "Unknown"
-                        else:
-                            country_name = str(country_name_raw)
-                        country_emoji_raw = country_info.get('emoji')
-                        country_emoji = country_emoji_raw if isinstance(country_emoji_raw, str) else ""
-
-                        for card_value, success, _ in pmi_results:
-                            if not success:
-                                continue
-                            if card_value.count('|') == 2:
-                                display_card = f"{card_value}|xxx"
-                            else:
-                                display_card = card_value
-                            summary_text = (
-                                f"{display_card} - #{bin6} - {scheme_upper} - {card_type_upper} - "
-                                f"{brand_name} - {bank_name} - {country_name} {country_emoji} - "
-                                f"PMI ✅ {pmi_success_rate:.1f}% - CHECK ✅ {auth_success_rate:.1f}%"
-                            )
-                            try:
-                                await app.send_message(
-                                    SUCCESS_CHANNEL_ID,
-                                    summary_text,
-                                    disable_web_page_preview=True
-                                )
-                            except Exception as send_exc:
-                                logger.error(f"Failed to send success summary to channel: {send_exc}")
+            await publish_success_to_channel(
+                app,
+                card_info,
+                generated_cards,
+                succeeded_cards,
+                pmi_results,
+            )
             
             # Send report to owner
             await send_report(
@@ -1048,6 +1131,38 @@ async def main():
             await message.reply_text("⛔ Proxy disabled.")
         else:
             await message.reply_text("Usage: `/proxy on` or `/proxy off`", disable_web_page_preview=True)
+
+    @app.on_message(filters.command("binlookupproxy") & filters.user(OWNER_USER_ID))
+    async def bin_lookup_proxy_command(client: Client, message: Message):
+        """Toggle the optional BIN lookup proxy."""
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            state = "enabled" if bin_lookup_proxy_enabled else "disabled"
+            url_info = BIN_LOOKUP_PROXY_URL or "not set"
+            await message.reply_text(
+                f"BIN lookup proxy is `{state}` (URL: `{url_info}`). Usage: `/binlookupproxy on` or `/binlookupproxy off`",
+                disable_web_page_preview=True
+            )
+            return
+        
+        action = parts[1].lower()
+        if action in {"on", "enable", "enabled"}:
+            if not BIN_LOOKUP_PROXY_URL:
+                await message.reply_text(
+                    "⚠️ Set `BIN_LOOKUP_PROXY_URL` in config.env before enabling the BIN lookup proxy.",
+                    disable_web_page_preview=True
+                )
+                return
+            set_bin_lookup_proxy_enabled(True)
+            await message.reply_text("✅ BIN lookup proxy enabled.")
+        elif action in {"off", "disable", "disabled"}:
+            set_bin_lookup_proxy_enabled(False)
+            await message.reply_text("⛔ BIN lookup proxy disabled.")
+        else:
+            await message.reply_text(
+                "Usage: `/binlookupproxy on` or `/binlookupproxy off`",
+                disable_web_page_preview=True
+            )
     
     # Start the bot
     async with app:
